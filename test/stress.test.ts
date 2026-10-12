@@ -1,7 +1,7 @@
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { after, soon } from '../fixtures/app';
-import { installStress, type TestingLibraryConfig } from '../src/index';
+import { DEFAULT_EXEMPT, installStress, type TestingLibraryConfig } from '../src/index';
 
 // The delays timers are actually given, recorded under the wrapping installStress adds.
 let given: (number | undefined)[] = [];
@@ -12,6 +12,8 @@ beforeEach(() => {
   // These tests say when stress mode is on; a run started by the command itself must not decide for them.
   vi.stubEnv('VITEST_FLAKY', '');
   vi.stubEnv('VITEST_FLAKY_SEED', undefined);
+  vi.stubEnv('VITEST_FLAKY_SLOWDOWN', undefined);
+  vi.stubEnv('VITEST_FLAKY_MAX_RESUME', undefined);
   given = [];
   globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
     given.push(delay);
@@ -70,6 +72,80 @@ describe('installStress', () => {
     clearTimeout(after(3000, () => {}));
 
     expect(given).toEqual([3000]);
+  });
+
+  it('takes a list of patterns for what is not the app, which can add to the default', () => {
+    undo.push(installStress({ enabled: true, seed: 3, exempt: [DEFAULT_EXEMPT, /[\\/]fixtures[\\/]/] }));
+    clearTimeout(after(3000, () => {}));
+
+    expect(given).toEqual([3000]);
+  });
+
+  it('takes the slowdown from the environment, and an option wins over it', () => {
+    vi.stubEnv('VITEST_FLAKY_SLOWDOWN', '1');
+    undo.push(installStress({ enabled: true, seed: 3 }));
+    for (let i = 0; i < 10; i++) clearTimeout(after(3000, () => {}));
+    expect(given).toEqual(Array(10).fill(3000));
+
+    undo.splice(0).forEach((restore) => restore());
+    given = [];
+    undo.push(installStress({ enabled: true, seed: 3, maxSlowdown: 30 }));
+    for (let i = 0; i < 10; i++) clearTimeout(after(3000, () => {}));
+    expect(given.some((delay) => delay! < 3000)).toBe(true);
+  });
+
+  it('takes the late resume from the environment', async () => {
+    vi.stubEnv('VITEST_FLAKY_MAX_RESUME', '0');
+    let current = async (callback: () => Promise<unknown>) => callback();
+    const library: TestingLibraryConfig = {
+      getConfig: () => ({ asyncWrapper: current }),
+      configure: ({ asyncWrapper }) => void (current = asyncWrapper as typeof current),
+    };
+    undo.push(installStress({ enabled: true, seed: 5, testingLibrary: library }));
+    for (let i = 0; i < 5; i++) await current(async () => 'found');
+
+    expect(given).toEqual(Array(5).fill(0));
+  });
+
+  it.each([-1, NaN, Infinity, 2 ** 31])('refuses a maxResumeDelayMs of %s', (maxResumeDelayMs) => {
+    expect(() => installStress({ enabled: true, maxResumeDelayMs })).toThrow(RangeError);
+  });
+
+  it('refuses a slowdown from the environment that would not shorten anything', () => {
+    vi.stubEnv('VITEST_FLAKY_SLOWDOWN', 'fast');
+
+    expect(() => installStress({ enabled: true })).toThrow(RangeError);
+  });
+
+  it('checks the options and the variables only when stress is on, and names where a bad value came from', () => {
+    vi.stubEnv('VITEST_FLAKY_SLOWDOWN', 'fast');
+    expect(() => installStress({ enabled: false, exempt: [], maxSlowdown: 0, maxResumeDelayMs: -1 })).not.toThrow();
+    expect(() => installStress({ enabled: true })).toThrow(/VITEST_FLAKY_SLOWDOWN must be/);
+    expect(() => installStress({ enabled: true, maxSlowdown: 0 })).toThrow(/^maxSlowdown must be/);
+
+    vi.stubEnv('VITEST_FLAKY_SLOWDOWN', undefined);
+    vi.stubEnv('VITEST_FLAKY_MAX_RESUME', '-5');
+    expect(() => installStress({ enabled: true })).toThrow(/VITEST_FLAKY_MAX_RESUME must be/);
+  });
+
+  it('refuses an empty list of patterns, which would leave every timer the app\'s', () => {
+    expect(() => installStress({ enabled: true, exempt: [] })).toThrow(RangeError);
+  });
+
+  it('leaves a pattern the caller shares as it was', () => {
+    const shared = /[\\/]fixtures[\\/]/g;
+    shared.lastIndex = 7;
+    undo.push(installStress({ enabled: true, seed: 3, exempt: [shared] }));
+    clearTimeout(after(3000, () => {}));
+
+    expect(shared.lastIndex).toBe(7);
+  });
+
+  it('gives the same answer for every timer when a pattern has the g flag', () => {
+    undo.push(installStress({ enabled: true, seed: 3, exempt: [/[\\/]fixtures[\\/]/g] }));
+    for (let i = 0; i < 4; i++) clearTimeout(after(3000, () => {}));
+
+    expect(given).toEqual([3000, 3000, 3000, 3000]);
   });
 
   it('takes the slowdown it is given', () => {
@@ -142,7 +218,7 @@ describe('installStress', () => {
     expect(given).toEqual([3000]);
   });
 
-  it.each([0, 0.5, NaN])('refuses a maxSlowdown of %s, which would not shorten anything', (maxSlowdown) => {
+  it.each([0, 0.5, NaN, Infinity])('refuses a maxSlowdown of %s, which would not shorten anything', (maxSlowdown) => {
     expect(() => installStress({ enabled: true, maxSlowdown })).toThrow(RangeError);
   });
 

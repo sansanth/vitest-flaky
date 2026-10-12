@@ -1,3 +1,5 @@
+import { atLeast, fromEnv, MAX_TIMER_MS } from './limit.js';
+
 type Timer = (handler: TimerHandler, delay?: number, ...args: unknown[]) => unknown;
 interface TimerScope {
   setTimeout: Timer;
@@ -13,8 +15,16 @@ export const DEFAULT_EXEMPT =
 
 const OFF = ['', '0', 'false', 'off', 'no'];
 
-// The longest delay a timer accepts (about 24 days): a held interval is set for it, so clearInterval still works.
-const NEVER_MS = 2 ** 31 - 1;
+/** One pattern or a list. Either replaces the default, so to add to it start the list with `DEFAULT_EXEMPT`. */
+export type Exempt = RegExp | readonly RegExp[];
+
+function patterns(exempt: Exempt | undefined): RegExp[] {
+  const all = [exempt ?? DEFAULT_EXEMPT].flat();
+  if (all.length === 0) throw new RangeError('exempt must hold at least one pattern');
+  // The g and y flags make `test` remember where it matched last, so the answer would change from one timer to the
+  // next. Copies, as the caller's pattern may be shared.
+  return all.map((p) => (/[gy]/.test(p.flags) ? new RegExp(p.source, p.flags.replace(/[gy]/g, '')) : p));
+}
 
 // Read when needed, not at import: Vitest's browser mode has no `process`.
 const proc = () => (globalThis as { process?: { env: Record<string, string | undefined>; cwd(): string } }).process;
@@ -48,10 +58,11 @@ export function callerOf(stack: unknown): string {
 // Both sides use forward slashes, which is how Windows paths come out of a stack as often as not. A timer whose caller
 // cannot be read is left alone: shortening a test's own wait is worse than missing one of the app's.
 const slashes = (path: string) => path.replaceAll('\\', '/');
-function setByApp(exempt: RegExp): boolean {
+function setByApp(exempt: RegExp[]): boolean {
   const caller = slashes(callerOf(new Error().stack));
   const root = slashes(proc()?.cwd() ?? '');
-  return caller !== '' && !exempt.test(root.length > 1 ? caller.replace(root, '') : caller);
+  const path = root.length > 1 ? caller.replace(root, '') : caller;
+  return caller !== '' && !exempt.some((pattern) => pattern.test(path));
 }
 
 function wrap(name: keyof TimerScope, delayFor: (delay: number | undefined) => number | undefined): () => void {
@@ -81,7 +92,7 @@ function randomFrom(seed: number): () => number {
 
 export interface HoldOptions {
   /** Timers set from frames matching this are not the app's. Default `DEFAULT_EXEMPT`. */
-  exempt?: RegExp;
+  exempt?: Exempt;
 }
 
 /**
@@ -90,8 +101,8 @@ export interface HoldOptions {
  * the test moves the clock. Intervals set by tests and test tooling run as usual. Returns a function that undoes it.
  */
 export function holdBackgroundIntervals(options: HoldOptions = {}): () => void {
-  const exempt = options.exempt ?? DEFAULT_EXEMPT;
-  return wrap('setInterval', (delay) => (setByApp(exempt) ? NEVER_MS : delay));
+  const exempt = patterns(options.exempt);
+  return wrap('setInterval', (delay) => (setByApp(exempt) ? MAX_TIMER_MS : delay));
 }
 
 /** What `installStress` needs from Testing Library: pass `configure` and `getConfig` from the package your tests use. */
@@ -111,7 +122,7 @@ export interface StressOptions {
   maxResumeDelayMs?: number;
   /** Without it, the late resume is left out. */
   testingLibrary?: TestingLibraryConfig;
-  exempt?: RegExp;
+  exempt?: Exempt;
 }
 
 /**
@@ -127,10 +138,15 @@ export interface StressOptions {
  */
 export function installStress(options: StressOptions = {}): () => void {
   if (!(options.enabled ?? !OFF.includes((envVar('VITEST_FLAKY') ?? '').trim().toLowerCase()))) return () => {};
-  const exempt = options.exempt ?? DEFAULT_EXEMPT;
-  const maxSlowdown = options.maxSlowdown ?? 30;
-  if (!(maxSlowdown >= 1)) throw new RangeError('maxSlowdown must be 1 or more');
-  const maxResumeDelayMs = options.maxResumeDelayMs ?? 100;
+  const exempt = patterns(options.exempt);
+  const maxSlowdown =
+    options.maxSlowdown === undefined
+      ? (fromEnv(envVar('VITEST_FLAKY_SLOWDOWN'), 'VITEST_FLAKY_SLOWDOWN', 1) ?? 30)
+      : atLeast(options.maxSlowdown, 'maxSlowdown', 1);
+  const maxResumeDelayMs =
+    options.maxResumeDelayMs === undefined
+      ? (fromEnv(envVar('VITEST_FLAKY_MAX_RESUME'), 'VITEST_FLAKY_MAX_RESUME', 0, MAX_TIMER_MS) ?? 100)
+      : atLeast(options.maxResumeDelayMs, 'maxResumeDelayMs', 0, MAX_TIMER_MS);
   // A fixed seed replays a failure: timers are set in the same order run to run, so the same delays come out. The late
   // resumes draw from a stream of their own: when a `waitFor` settles depends on the clock and would shift the rest.
   const seed = options.seed ?? Number(envVar('VITEST_FLAKY_SEED') ?? 1);
