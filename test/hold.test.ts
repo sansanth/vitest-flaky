@@ -44,6 +44,34 @@ describe('holdBackgroundIntervals', () => {
     expect(ticks).toBeGreaterThan(0);
   });
 
+  it('takes a list of patterns, which can add to the default', async () => {
+    undo.push(holdBackgroundIntervals({ exempt: [DEFAULT_EXEMPT, /[\\/]fixtures[\\/]/] }));
+    let ticks = 0;
+    const own = setInterval(() => ticks++, 5);
+    const helper = every(5, () => ticks++);
+
+    await sleep(60);
+    clearInterval(own);
+    clearInterval(helper);
+
+    expect(ticks).toBeGreaterThan(2);
+  });
+
+  it('refuses an empty list', () => {
+    expect(() => holdBackgroundIntervals({ exempt: [] })).toThrow(RangeError);
+  });
+
+  it('holds an interval that matches none of the patterns in a list', async () => {
+    undo.push(holdBackgroundIntervals({ exempt: [DEFAULT_EXEMPT, /[\\/]nowhere[\\/]/] }));
+    let ticks = 0;
+    const id = every(5, () => ticks++);
+
+    await sleep(60);
+    clearInterval(id);
+
+    expect(ticks).toBe(0);
+  });
+
   it('is undone by the function it returns', async () => {
     holdBackgroundIntervals()();
     let ticks = 0;

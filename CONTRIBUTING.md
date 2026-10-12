@@ -1,6 +1,7 @@
 # Contributing
 
-The package is two small files in `src/`. Read `README.md` and `src/index.ts` first.
+The package is two small files in `src/`, `index.ts` and `cli.ts`, plus the number checks they share in `limit.ts`. Read
+`README.md` and `src/index.ts` first.
 
 ## Check your change
 

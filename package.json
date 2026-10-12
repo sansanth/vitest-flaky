@@ -1,6 +1,6 @@
 {
   "name": "vitest-flaky",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Find flaky Vitest tests on your laptop: replays a slow CI runner by firing the app's timers early, resuming tests late and shuffling the order, with a seed that replays a failure.",
   "keywords": [
     "vitest",
