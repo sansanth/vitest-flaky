@@ -22,11 +22,11 @@ export interface CliDeps {
   random(): number;
   /** Where vitest's JSON reporter writes a round's results. */
   reportPath(round: number): string;
-  /** The parsed file at `path`, or undefined if vitest left none. */
+  /** The parsed file at `path`, or undefined if vitest left none. Throws if there is one that cannot be read or parsed. */
   readReport(path: string): unknown;
 }
 
-export interface Failure {
+interface Failure {
   /** Relative to the directory the command ran in, with forward slashes. */
   file: string;
   /** The tests of this file that failed. */
@@ -37,22 +37,64 @@ export interface Failure {
 
 const quote = (arg: string) => (/^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`);
 
+interface FileResult {
+  name: string;
+  status: string;
+  message?: string;
+  assertionResults?: { fullName: string; status: string }[];
+}
 interface JsonReport {
-  testResults?: {
-    name: string;
-    status: string;
-    message?: string;
-    assertionResults?: { fullName: string; status: string }[];
-  }[];
+  testResults?: FileResult[];
 }
 
-function failures(report: unknown): Failure[] {
-  return ((report as JsonReport | undefined)?.testResults ?? []).flatMap((file) => {
-    const tests = (file.assertionResults ?? []).filter((test) => test.status === 'failed').map((test) => test.fullName);
+// installStress keeps 32 bits of a seed, so seeds from here on would repeat earlier ones.
+const SEED_LIMIT = 2 ** 32;
+
+type Reason = 'no-report' | 'unreadable-report' | 'unrecognised-report' | 'no-failed-tests';
+
+const posix = (path: string) => path.split(sep).join('/');
+const relativeToCwd = (path: string) => {
+  try {
+    return posix(relative(process.cwd(), path));
+  } catch {
+    // The working directory was deleted during the run: the path as vitest gave it will do.
+    return posix(path);
+  }
+};
+
+const isFile = (file: FileResult | null): file is FileResult => typeof file?.name === 'string';
+
+interface Outcome {
+  failed: Failure[];
+  /** Why `failed` is empty, when it is. */
+  reason: Reason;
+  /** What went wrong reading the report, if that is why. */
+  error?: string;
+}
+
+/**
+ * The failed files of the report `read` returns, or why there are none to give. What is not the shape vitest writes is
+ * left out, a file that failed still listed with the tests that could be read; and if that leaves no failure, the report
+ * is called unrecognised, as it may have held some.
+ */
+function explain(read: () => unknown): Outcome {
+  let report: unknown;
+  try {
+    report = read();
+  } catch (error) {
+    return { failed: [], reason: 'unreadable-report', error: error instanceof Error ? error.message : String(error) };
+  }
+  if (report === undefined) return { failed: [], reason: 'no-report' };
+  const files = (report as JsonReport | null)?.testResults;
+  if (!Array.isArray(files)) return { failed: [], reason: 'unrecognised-report' };
+  const named = files.filter(isFile);
+  const failed = named.flatMap((file) => {
+    const results = Array.isArray(file.assertionResults) ? file.assertionResults : [];
+    const tests = results.filter((test) => test?.status === 'failed' && typeof test.fullName === 'string').map((test) => test.fullName);
     if (tests.length === 0 && file.status !== 'failed') return [];
-    const path = relative(process.cwd(), file.name).split(sep).join('/');
-    return [{ file: path, tests, ...(file.message && { error: file.message }) }];
+    return [{ file: relativeToCwd(file.name), tests, ...(file.message && { error: file.message }) }];
   });
+  return { failed, reason: named.length === files.length ? 'no-failed-tests' : 'unrecognised-report' };
 }
 
 // The exit code a shell reports for a process that a signal ended.
@@ -61,6 +103,8 @@ function signalCode(name: string): number {
   return number ? 128 + number : 1;
 }
 
+// What `Number` reads as one, so the value after a space is the same as after an `=`.
+const isNumber = (arg = '') => arg.trim() !== '' && Number.isFinite(Number(arg));
 const OPTION = /^--(slowdown|max-resume)(?:=(.*))?$/s;
 
 /**
@@ -70,22 +114,40 @@ const OPTION = /^--(slowdown|max-resume)(?:=(.*))?$/s;
  */
 export async function main(argv: string[], deps: CliDeps): Promise<number> {
   const flags: Record<string, string> = {};
-  const passThrough: string[] = [];
+  const own: string[] = [];
+  let rest: string[] = [];
   let count: number | undefined;
   let json = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
+    // Everything from a `--` on is for vitest, which ignores it, and is not read as this command's options.
+    if (arg === '--') {
+      rest = argv.slice(i);
+      break;
+    }
     const option = OPTION.exec(arg);
     if (arg === '--json') json = true;
     // In `--slowdown 60` the next argument is the value only if it is a number, so a file filter is not taken for one.
-    else if (option) flags[option[1]!] = option[2] ?? (/^\d+(?:\.\d+)?$/.test(argv[i + 1] ?? '') ? argv[++i]! : '');
-    else if (count === undefined && passThrough.length === 0 && /^\d+$/.test(arg)) count = Number(arg);
-    else passThrough.push(arg);
+    else if (option) flags[option[1]!] = option[2] ?? (isNumber(argv[i + 1]) ? argv[++i]! : '');
+    else if (count === undefined && own.length === 0 && /^\d+$/.test(arg)) count = Number(arg);
+    else own.push(arg);
   }
-  const rounds = count ?? 3;
+  const passThrough = [...own, ...rest];
+  // No count past this can run, and a larger one would be Infinity, which JSON prints as null.
+  const rounds = Math.min(count ?? 3, SEED_LIMIT);
+  // What a refusal reports: the count as given, unless it is too large for a number.
+  const asked = count !== undefined && Number.isFinite(count) ? count : rounds;
 
   const progress = json ? deps.error : deps.log;
-  const results: { seed: number; exitCode: number | null; signal?: string; ok: boolean; failed: Failure[] }[] = [];
+  const results: {
+    seed: number;
+    exitCode: number | null;
+    signal?: string;
+    ok: boolean;
+    failed: Failure[];
+    unexplained?: true;
+    reason?: Reason;
+  }[] = [];
   const summary = (code: number, extra: object = {}) => {
     const seeds = results.map((r) => r.seed);
     if (json) deps.log(JSON.stringify({ ok: code === 0, rounds, seeds, results, ...extra }, null, 2));
@@ -93,26 +155,27 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
   };
   const refuse = (message: string) => {
     deps.error(message);
-    return summary(2, { error: message });
+    return summary(2, { error: message, rounds: asked });
   };
 
   if (rounds < 1) return refuse('the number of rounds must be at least 1');
-  if (passThrough.some((arg) => arg.startsWith('--sequence.seed'))) {
+  if (count !== undefined && count >= SEED_LIMIT) return refuse(`the number of rounds must be below ${SEED_LIMIT}`);
+  if (own.some((arg) => arg.startsWith('--sequence.seed'))) {
     return refuse('the command sets --sequence.seed itself, one seed per round');
   }
   // A bare --outputFile is the json reporter's too; one for another reporter (--outputFile.junit) is not in the way.
-  if (json && passThrough.some((arg) => /^--outputFile(?:=|\.json\b|$)/.test(arg))) {
-    return refuse('--json gives the json reporter an output file of its own: drop --outputFile and --outputFile.json');
-  }
-  const given = deps.env.VITEST_FLAKY_SEED;
+  const outputFile = /^--(?:outputFile|output-file)(?:=|\.json(?:=|$)|$)/;
+  const taken = json ? own.find((arg) => outputFile.test(arg)) : undefined;
+  if (taken) return refuse(`--json gives the json reporter an output file of its own: drop ${taken.split('=')[0]}`);
+  const given = deps.env.VITEST_FLAKY_SEED?.trim();
   if (given && !(Number.isSafeInteger(Number(given)) && Number(given) >= 1)) {
     return refuse('VITEST_FLAKY_SEED must be a whole number from 1');
   }
-  // From 1: seed 0 is the same as seed 1 to installStress, which would make two rounds identical.
+  // From 1: seed 0 gives the same timer delays as seed 1 in installStress, which would make two rounds alike.
   const first = Number(given) || 1 + Math.floor(deps.random() * 1e6);
   // installStress keeps 32 bits of a seed, so seeds past that would repeat earlier ones.
-  if (!(first + rounds - 1 < 2 ** 32)) {
-    return refuse(`${rounds} rounds from seed ${first} would reach 4294967296: use fewer rounds or a lower seed`);
+  if (!(first + rounds - 1 < SEED_LIMIT)) {
+    return refuse(`${rounds} rounds from seed ${first} would reach ${SEED_LIMIT}: use fewer rounds or a lower seed`);
   }
   // The flag wins over the variable, as a flag is for one run. A flag with no value is a mistake, not an absent flag; a
   // variable that is blank is absent, as it is to installStress.
@@ -136,11 +199,11 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
   // Under --json vitest also gets its json reporter, writing to a file of ours. `--reporter=json` alone would replace
   // the default reporter, so that stays unless the user chose reporters. These go ahead of the user's arguments, as
   // vitest ignores whatever follows a `--`.
-  const named = passThrough.flatMap((arg, i) =>
-    arg === '--reporter' ? [passThrough[i + 1]] : arg.startsWith('--reporter=') ? arg.slice(11).split(',') : [],
+  const named = own.flatMap((arg, i) =>
+    arg === '--reporter' ? (own[i + 1] ?? '').split(',') : arg.startsWith('--reporter=') ? arg.slice(11).split(',') : [],
   );
   const reporters = [
-    ...(passThrough.some((arg) => arg.startsWith('--reporter')) ? [] : ['--reporter=default']),
+    ...(own.some((arg) => arg.startsWith('--reporter')) ? [] : ['--reporter=default']),
     ...(named.includes('json') ? [] : ['--reporter=json']),
   ];
 
@@ -162,12 +225,20 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
     const code = result.status ?? (result.signal ? signalCode(result.signal) : 1);
     // A signal this command was sent ended the round, or made it fail some other way on the way down.
     const stopped = code !== 0 ? deps.interrupted() : undefined;
+    const reported = json && code !== 0 && !result.error;
+    const outcome = reported ? explain(() => deps.readReport(report)) : undefined;
+    const failed = outcome?.failed ?? [];
+    // A report that cannot be read is no better than none: `unexplained` says so, and this says why. A round that was
+    // stopped may have left half a file, which is not worth a note on top of the one about the signal.
+    if (outcome?.error && !stopped) deps.error(`could not read vitest's report: ${outcome.error}`);
     results.push({
       seed,
       exitCode: result.status,
       ...(result.signal && { signal: result.signal }),
       ok: code === 0,
-      failed: json && code !== 0 ? failures(deps.readReport(report)) : [],
+      failed,
+      // A round can fail with no failed test: an unhandled error, a coverage threshold, or a report that was not read.
+      ...(outcome && !failed.length && !stopped && { unexplained: true, reason: outcome.reason }),
     });
     if (result.error) {
       const message = `could not run vitest: ${result.error.message}`;
@@ -212,7 +283,7 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
   let received: string | undefined;
   // A signal sent to this process alone does not reach vitest, so it is passed on. A terminal's Ctrl-C reaches both,
   // and a second SIGINT would cut short the shutdown vitest began on the first, so SIGINT waits to see if vitest is
-  // still up.
+  // still up. The first signal decides the exit code.
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     process.on(signal, () => {
       received ??= signal;
@@ -243,8 +314,10 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
       readReport: (path) => {
         try {
           return JSON.parse(readFileSync(path, 'utf8'));
-        } catch {
-          return undefined;
+        } catch (error) {
+          // No report at all is a round that died before writing one; anything else is worth saying.
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
         }
       },
     });

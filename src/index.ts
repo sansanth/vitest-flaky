@@ -19,7 +19,10 @@ const OFF = ['', '0', 'false', 'off', 'no'];
 export type Exempt = RegExp | readonly RegExp[];
 
 function patterns(exempt: Exempt | undefined): RegExp[] {
-  const all = [exempt ?? DEFAULT_EXEMPT].flat();
+  const all = [exempt === undefined ? DEFAULT_EXEMPT : exempt].flat();
+  if (!all.every((p) => Object.prototype.toString.call(p) === '[object RegExp]')) {
+    throw new TypeError('exempt must be a RegExp or a list of them');
+  }
   if (all.length === 0) throw new RangeError('exempt must hold at least one pattern');
   // The g and y flags make `test` remember where it matched last, so the answer would change from one timer to the
   // next. Copies, as the caller's pattern may be shared.
@@ -42,39 +45,85 @@ function scopes(): TimerScope[] {
 // lines that end in `line:column`, in V8's format (`at fn (file:1:2)`) and in Firefox's and Safari's (`fn@file:1:2`).
 const frameFile = (frame: string) => /[\s(@]([^\s()@]+):\d+:\d+\)?\s*$/.exec(frame)?.[1];
 // A tool that sets `Error.prepareStackTrace` can make `stack` something other than a string.
-const frames = (stack: unknown) => (typeof stack === 'string' ? stack.split('\n') : []).filter((line) => frameFile(line));
+const lines = (stack: unknown) => (typeof stack === 'string' ? stack.split('\n') : []);
 // Undefined if there was no stack to read at import, as when `Error.stackTraceLimit` is 0: then no caller is named.
-const OWN_FILE = frameFile(String(frames(new Error().stack)[0]));
+const OWN_FILE = lines(new Error().stack).map(frameFile).find(Boolean);
 
 /**
  * The first frame of `stack` outside this file: whoever called the timer.
  * @internal
  */
 export function callerOf(stack: unknown): string {
-  return OWN_FILE ? (frames(stack).find((frame) => frameFile(frame) !== OWN_FILE) ?? '') : '';
+  if (!OWN_FILE) return '';
+  for (const line of lines(stack)) {
+    const file = frameFile(line);
+    if (file && file !== OWN_FILE) return line;
+  }
+  return '';
 }
 
 // Matched without the project's own directory, so an app checked out under a folder named `test` is still the app.
 // Both sides use forward slashes, which is how Windows paths come out of a stack as often as not. A timer whose caller
 // cannot be read is left alone: shortening a test's own wait is worse than missing one of the app's.
 const slashes = (path: string) => path.replaceAll('\\', '/');
+// The last working directory that could be read, so one deleted mid-run does not change what counts as the app's. Empty
+// where there is no `process`, as in a browser, where paths are not stripped. Undefined if it was never readable.
+let knownRoot: string | undefined;
+function projectRoot(): string | undefined {
+  const p = proc();
+  if (typeof p?.cwd !== 'function') return '';
+  try {
+    knownRoot = slashes(p.cwd());
+  } catch {
+    // The working directory was deleted: the app's timer must not throw for that.
+  }
+  return knownRoot;
+}
+
 function setByApp(exempt: RegExp[]): boolean {
   const caller = slashes(callerOf(new Error().stack));
-  const root = slashes(proc()?.cwd() ?? '');
+  const root = projectRoot();
+  // Without the project's directory, a path under a folder named `test` would read as the tests', so the timer is left
+  // alone, as one with no caller is.
+  if (root === undefined) return false;
   const path = root.length > 1 ? caller.replace(root, '') : caller;
   return caller !== '' && !exempt.some((pattern) => pattern.test(path));
 }
 
+// Wrappers that were undone while something else sat on top of them, with what each wraps. They only pass calls on, so
+// the next wrapper goes around what they wrap instead of stacking one more layer on them.
+const undone = new WeakMap<object, Timer>();
+const pastDead = (timer: Timer) => {
+  for (let dead = undone.get(timer); dead; dead = undone.get(timer)) timer = dead;
+  return timer;
+};
+let warned = false;
+
 function wrap(name: keyof TimerScope, delayFor: (delay: number | undefined) => number | undefined): () => void {
+  if (projectRoot() === undefined && !warned) {
+    warned = true;
+    console.warn('vitest-flaky: the working directory cannot be read, so timers are left alone');
+  }
   const restores = scopes().map((scope) => {
-    const original = scope[name];
+    const original = pastDead(scope[name]);
+    let on = true;
+    let done = false;
     // The original's own properties come along, such as the symbol `util.promisify` looks for on Node's timers.
     const wrapper = Object.assign(function (this: unknown, handler: TimerHandler, delay?: number, ...args: unknown[]) {
-      return original.call(this, handler, delayFor(delay), ...args);
+      return original.call(this, handler, on ? delayFor(delay) : delay, ...args);
     }, original);
     scope[name] = wrapper;
-    // Another wrapper installed since, such as fake timers, is not ours to remove.
-    return () => void (scope[name] === wrapper && (scope[name] = original));
+    return () => {
+      if (done) return;
+      done = true;
+      on = false;
+      // Another wrapper installed since, such as fake timers, is not ours to remove: it keeps calling ours, which then
+      // leaves the delay as it is.
+      if (scope[name] === wrapper) {
+        // Past any wrapper below that was undone while this one sat on top of it.
+        scope[name] = pastDead(original);
+      } else undone.set(wrapper, original);
+    };
   });
   return () => restores.forEach((restore) => restore());
 }
@@ -112,13 +161,19 @@ export interface TestingLibraryConfig {
 }
 
 export interface StressOptions {
-  /** Default: on when the `VITEST_FLAKY` environment variable is set. */
+  /** Default: on when `VITEST_FLAKY` is set to something other than blank, `0`, `false`, `off` or `no`. */
   enabled?: boolean;
   /** Replays a run: the same seed gives the same delays. Default `VITEST_FLAKY_SEED`, or 1. */
   seed?: number;
-  /** A timeout the app sets fires after between all of its delay and this fraction of it. Default 30. */
+  /**
+   * A timeout the app sets fires after between all of its delay and `1 / maxSlowdown` of it. Default
+   * `VITEST_FLAKY_SLOWDOWN`, or 30.
+   */
   maxSlowdown?: number;
-  /** After every `findBy`/`waitFor` the test resumes up to this late. Needs `testingLibrary`. Default 100. */
+  /**
+   * After every `findBy`/`waitFor` the test resumes up to this late, at most 2147483647. Needs `testingLibrary`.
+   * Default `VITEST_FLAKY_MAX_RESUME`, or 100.
+   */
   maxResumeDelayMs?: number;
   /** Without it, the late resume is left out. */
   testingLibrary?: TestingLibraryConfig;
@@ -134,7 +189,8 @@ export interface StressOptions {
  * - after every `findBy`/`waitFor` the test resumes up to `maxResumeDelayMs` late, as on a busy runner, so whatever the
  *   app queued meanwhile runs before the next step.
  *
- * Off unless `enabled` or `VITEST_FLAKY` says otherwise. Returns a function that undoes it.
+ * Off unless `enabled` or `VITEST_FLAKY` says otherwise. Returns a function that undoes it. `exempt` throws a
+ * `TypeError` unless it is a RegExp or a list of them.
  */
 export function installStress(options: StressOptions = {}): () => void {
   if (!(options.enabled ?? !OFF.includes((envVar('VITEST_FLAKY') ?? '').trim().toLowerCase()))) return () => {};
@@ -149,7 +205,7 @@ export function installStress(options: StressOptions = {}): () => void {
       : atLeast(options.maxResumeDelayMs, 'maxResumeDelayMs', 0, MAX_TIMER_MS);
   // A fixed seed replays a failure: timers are set in the same order run to run, so the same delays come out. The late
   // resumes draw from a stream of their own: when a `waitFor` settles depends on the clock and would shift the rest.
-  const seed = options.seed ?? Number(envVar('VITEST_FLAKY_SEED') ?? 1);
+  const seed = options.seed ?? Number(envVar('VITEST_FLAKY_SEED')?.trim() || 1);
   if (!Number.isInteger(seed)) throw new RangeError('seed must be a whole number');
   const random = randomFrom(seed);
   const randomResume = randomFrom(seed ^ 0x9e3779b9);
@@ -160,23 +216,29 @@ export function installStress(options: StressOptions = {}): () => void {
   const library = options.testingLibrary;
   if (library) {
     const { asyncWrapper } = library.getConfig();
+    let on = true;
     library.configure({
       asyncWrapper: (callback) =>
         asyncWrapper(async () => {
           const result = await callback();
-          await new Promise((resolve) => realSetTimeout(resolve, Math.floor(randomResume() * maxResumeDelayMs)));
+          if (on) {
+            await new Promise((resolve) => realSetTimeout(resolve, Math.floor(randomResume() * maxResumeDelayMs)));
+          }
           return result;
         }),
     });
     const ours = library.getConfig().asyncWrapper;
     restoreWrapper = () => {
+      on = false;
       if (library.getConfig().asyncWrapper === ours) library.configure({ asyncWrapper });
     };
   }
 
   // Log-uniform, so a mild slowdown comes up as often as a severe one.
   const restoreTimers = wrap('setTimeout', (delay) =>
-    delay && delay > 0 && setByApp(exempt) ? Math.floor(delay * maxSlowdown ** -random()) : delay,
+    delay && delay > 0 && delay <= MAX_TIMER_MS && setByApp(exempt)
+      ? Math.floor(delay * maxSlowdown ** -random())
+      : delay,
   );
   return () => {
     restoreTimers();
