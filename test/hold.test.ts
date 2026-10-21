@@ -46,15 +46,17 @@ describe('holdBackgroundIntervals', () => {
 
   it('takes a list of patterns, which can add to the default', async () => {
     undo.push(holdBackgroundIntervals({ exempt: [DEFAULT_EXEMPT, /[\\/]fixtures[\\/]/] }));
-    let ticks = 0;
-    const own = setInterval(() => ticks++, 5);
-    const helper = every(5, () => ticks++);
+    let own = 0;
+    let helper = 0;
+    const ownId = setInterval(() => own++, 5);
+    const helperId = every(5, () => helper++);
 
     await sleep(60);
-    clearInterval(own);
-    clearInterval(helper);
+    clearInterval(ownId);
+    clearInterval(helperId);
 
-    expect(ticks).toBeGreaterThan(2);
+    expect(own).toBeGreaterThan(0);
+    expect(helper).toBeGreaterThan(0);
   });
 
   it('refuses an empty list', () => {
@@ -98,7 +100,8 @@ describe('holdBackgroundIntervals', () => {
 
   it('still holds the app\'s intervals where there is no process, as in browser mode', async () => {
     vi.stubGlobal('process', undefined);
-    undo.push(holdBackgroundIntervals());
+    // Nothing is exempt: without a working directory to cut off, a checkout under a `test` folder would be.
+    undo.push(holdBackgroundIntervals({ exempt: /^$/ }));
     let ticks = 0;
     const id = every(5, () => ticks++);
     vi.unstubAllGlobals();
@@ -107,6 +110,10 @@ describe('holdBackgroundIntervals', () => {
     clearInterval(id);
 
     expect(ticks).toBe(0);
+  });
+
+  it('refuses an exempt that is not a RegExp', () => {
+    expect(() => holdBackgroundIntervals({ exempt: 'helpers' as never })).toThrow(TypeError);
   });
 
   it('does not touch timeouts', async () => {

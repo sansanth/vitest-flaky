@@ -15,6 +15,7 @@ it("works with Testing Library's own configure and getConfig, and with jsdom's w
   // jsdom runs animation frames on an interval of its own, which is the environment's, not the app's.
   await new Promise((resolve) => requestAnimationFrame(resolve));
 
+  expect(getConfig().asyncWrapper).not.toBe(before);
   restore();
   unhold();
   expect(getConfig().asyncWrapper).toBe(before);

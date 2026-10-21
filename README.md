@@ -98,7 +98,7 @@ Returns a function that undoes it.
 
 | Option | Default | |
 |---|---|---|
-| `enabled` | on when `VITEST_FLAKY` is set, and not to `0`, `false`, `off` or `no` | |
+| `enabled` | on when `VITEST_FLAKY` is set to something other than blank, `0`, `false`, `off` or `no` | |
 | `seed` | `VITEST_FLAKY_SEED`, or `1` | The same seed gives the same delays, in the same order. |
 | `maxSlowdown` | `VITEST_FLAKY_SLOWDOWN`, or `30` | A timeout fires after between all of its delay and `1 / maxSlowdown` of it, log-uniform, so a mild slowdown comes up as often as a severe one. |
 | `maxResumeDelayMs` | `VITEST_FLAKY_MAX_RESUME`, or `100` | How late a test may resume after a `findBy` or `waitFor`, up to 2147483647. |
@@ -108,8 +108,8 @@ Returns a function that undoes it.
 ### `vitest-flaky [rounds] [options] [vitest arguments]`
 
 Runs `vitest run --sequence.shuffle --sequence.seed=<seed>` `rounds` times (3 by default) with `VITEST_FLAKY=1` and a
-new seed each round, starting from `VITEST_FLAKY_SEED` when it is set. It runs your project's own vitest. The exit code
-is the failing round's.
+new seed each round, starting from `VITEST_FLAKY_SEED` when it is set and not blank. It runs your project's own
+vitest. The exit code is the failing round's.
 
 | Option | |
 |---|---|
@@ -119,7 +119,7 @@ is the failing round's.
 
 An option you pass to `installStress` in the setup file beats both. `--slowdown 60` works as well as `--slowdown=60`.
 The round count can follow the options (`vitest-flaky --json 10`) but not an argument for vitest, where it would be a
-file filter.
+file filter. A `--` ends the options: vitest ignores what follows it, and the command does not read it either.
 
 Ctrl-C, SIGTERM and SIGHUP stop the run: vitest is told, no further round starts, and the command exits with 128 plus
 the signal's number. A round that ends that way is reported as stopped, not as a failed seed. A terminal's Ctrl-C
@@ -150,15 +150,23 @@ on its own, as under the out-of-memory killer, is a failed seed with a replay co
   that failed: the `file` (relative to the working directory, with forward slashes), its failed `tests`, and the
   `error` if there is one.
 - `exitCode` is `null`, with the `signal`, for a round vitest was killed in.
+- `unexplained` is `true` when a round vitest ran failed with an empty `failed`: it found no failed test, as with an
+  unhandled error, a coverage threshold or a run with no test files, or left no usable report. `reason` says which: `no-failed-tests`,
+  `no-report`, `unreadable-report` or `unrecognised-report`. Look in stderr.
 - `error` takes the place of `replay` when vitest could not start or the run was stopped. Arguments the command refuses
   (exit code 2) get a summary with `error` as well, so stdout is always JSON.
 - The command adds vitest's `json` reporter, and the `default` one unless you pass a `--reporter`, from the command
   line. That replaces the `reporters` and `outputFile` of your vitest config for the run: to keep a JUnit file, also
-  pass `--reporter=junit`. `--outputFile` and `--outputFile.json` are refused, as the json reporter has a file of its
-  own.
+  pass `--reporter=junit`. `--outputFile`, `--output-file` and their `.json` forms are refused, as the json reporter has
+  a file of its own.
 
 ## Limits
 
+- Only `setTimeout` and `setInterval` on the global object (and `window`) are wrapped. A timer from `node:timers` or
+  `node:timers/promises`, or from a reference taken before `installStress` ran, keeps its delay, and so does a timeout
+  longer than 2147483647 ms.
+- Call `installStress` once per test run. A second call while the first is installed wraps it, so a delay shortens
+  twice. A setup file that runs for every test file in one process (`isolate: false`) does that.
 - A timer's caller is found by its file path, so code that schedules timers through a helper in your test folder counts
   as test code.
 - The order timers are set in must be the same from run to run for a seed to replay exactly; a test that depends on real
