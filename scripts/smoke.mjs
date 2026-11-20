@@ -1,12 +1,15 @@
 // The built package as a user gets it: the exports load, install and undo cleanly, and the command finds vitest.
 import { execFileSync, spawnSync } from 'node:child_process';
-import { holdBackgroundIntervals, installStress } from '../dist/index.js';
+import { clearAppTimersAtEnd, holdBackgroundIntervals, installStress, isDefaultExempt } from '../dist/index.js';
 
-const realSetInterval = globalThis.setInterval;
-const realSetTimeout = globalThis.setTimeout;
+const names = ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'];
+const real = names.map((name) => globalThis[name]);
 holdBackgroundIntervals()();
-installStress({ enabled: true, seed: 1 })();
-if (globalThis.setInterval !== realSetInterval || globalThis.setTimeout !== realSetTimeout) {
+installStress({ enabled: true, seed: 1, exempt: isDefaultExempt })();
+let end;
+clearAppTimersAtEnd({ afterAll: (fn) => (end = fn) })();
+end();
+if (names.some((name, i) => globalThis[name] !== real[i])) {
   throw new Error('smoke: undoing did not put the timers back');
 }
 

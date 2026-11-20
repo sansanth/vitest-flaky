@@ -5,6 +5,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-20
+
+### Added
+
+- `exempt` takes a function, `(timer: TimerInfo) => boolean`, that sees the frames above the caller, so a timer set
+  through a shared helper can be exempted by who called it. If it throws, the timer is left alone and it warns once.
+- `isDefaultExempt(timer)`, to add to the default from a function, and the `TimerInfo` type.
+- `clearAppTimersAtEnd({ afterAll })` clears the timeouts and intervals the app left pending when a test file ends, so
+  a library's leftover timer cannot fire after jsdom is gone. `report: true` lists what it cleared.
+
+### Changed
+
+- The `TypeError` for a bad `exempt` now reads "exempt must be a RegExp, a list of them, or a function".
+
 ## [0.3.0] - 2026-10-21
 
 ### Added
@@ -59,7 +73,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `vitest-flaky [rounds] [vitest arguments]`: runs the suite in stress mode, shuffled, a new seed each round, and
   prints the command that replays a failure.
 
-[Unreleased]: https://github.com/sansanth/vitest-flaky/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sansanth/vitest-flaky/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sansanth/vitest-flaky/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sansanth/vitest-flaky/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sansanth/vitest-flaky/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sansanth/vitest-flaky/releases/tag/v0.1.0
