@@ -13,7 +13,8 @@ runner. This package makes your laptop behave like that runner, on most runs ins
 - test files and tests run in a shuffled order;
 - each run has a seed, and a failure prints the command that replays it exactly.
 
-It also holds your app's intervals, so a poll can never fire between two steps of a test that did not ask for it.
+It also holds your app's intervals, so a poll can never fire between two steps of a test that did not ask for it, and
+clears the timers your app leaves pending when a test file ends, so one cannot fire after the environment is gone.
 
 ```sh
 npm install --save-dev vitest-flaky
@@ -27,14 +28,21 @@ In your Vitest setup file:
 
 ```ts
 import { configure, getConfig } from '@testing-library/react'; // or /dom, /vue, /svelte
-import { holdBackgroundIntervals, installStress } from 'vitest-flaky';
+import { afterAll } from 'vitest';
+import { clearAppTimersAtEnd, holdBackgroundIntervals, installStress } from 'vitest-flaky';
 
 holdBackgroundIntervals();
 installStress({ testingLibrary: { configure, getConfig } });
+clearAppTimersAtEnd({ afterAll });
 ```
 
 `installStress` does nothing until you ask for it. `holdBackgroundIntervals` always applies, in normal runs too: an app
-interval never fires there unless a test uses fake timers. Run the suite in stress mode:
+interval never fires there unless a test uses fake timers. `clearAppTimersAtEnd` always applies as well: when a file's
+last test is done, it clears every timeout and interval the app set and that is still pending. A library that leaves a
+timer behind, such as the fallback timer Recharts sets after drawing a chart, can otherwise fire after jsdom is torn
+down, throw, and fail the run with an uncaught error. Each of the three can be left out, and they work in any order.
+
+Run the suite in stress mode:
 
 ```sh
 npx vitest-flaky          # three rounds, each shuffled, each on a new seed
@@ -78,6 +86,29 @@ libraries it uses, is the app. Pass `exempt` to draw the line elsewhere. It take
 default, or a list that matches if any of it does. A list replaces the default as well, so one that should add to it
 starts with `DEFAULT_EXEMPT`: `exempt: [DEFAULT_EXEMPT, /my-helpers/]`. An empty list is refused.
 
+A pattern sees only the caller, which is not enough when a library sets every timer through one helper. Base UI's toast,
+tooltips, menus and popovers all go through `@base-ui/utils/useTimeout`, so a pattern can stress all of them or none.
+`exempt` also takes a function, which gets the whole stack and returns `true` for a timer that is not the app's:
+
+```ts
+import { installStress, isDefaultExempt } from 'vitest-flaky';
+
+// The toast's close timer keeps its delay, so a test can still press its Undo; every other Base UI timer is stressed.
+installStress({
+  testingLibrary: { configure, getConfig },
+  exempt: (t) => isDefaultExempt(t) || t.stack.some((frame) => /@base-ui\/react\/.*toast/.test(frame)),
+});
+```
+
+The function is given a `TimerInfo`: `kind` (`'setTimeout'` or `'setInterval'`), the `delay` the app asked for,
+`caller`, and `stack`, every frame outside vitest-flaky, nearest first. Frames are taken from the project directory
+down, with forward slashes, as patterns see them. Like a pattern, a function replaces the default, so start it with
+`isDefaultExempt(t) ||`: without that, the timers of your tests, Testing Library and jsdom count as the app's. If the
+function throws, the timer is left alone and the error is printed once. A timer the function sets itself is left alone.
+
+The stack holds as many frames as `Error.stackTraceLimit` allows, which is 10 under Vitest, and vitest-flaky's own take
+three of them. That is enough to see past a helper or two. To look further, raise the limit in the setup file.
+
 A test about a poll uses fake timers (`vi.useFakeTimers()`), which replace `setInterval` with one that fires as the test
 moves the clock, so a held interval still works there.
 
@@ -90,7 +121,7 @@ undoes it.
 
 | Option | Default | |
 |---|---|---|
-| `exempt` | `DEFAULT_EXEMPT` | Timers set from frames matching this are left alone. A pattern, or a list of them. |
+| `exempt` | `DEFAULT_EXEMPT` | Timers whose caller it matches, or for which it returns `true`, are left alone. A pattern, a list of them, or a function. |
 
 ### `installStress(options?)`
 
@@ -103,7 +134,24 @@ Returns a function that undoes it.
 | `maxSlowdown` | `VITEST_FLAKY_SLOWDOWN`, or `30` | A timeout fires after between all of its delay and `1 / maxSlowdown` of it, log-uniform, so a mild slowdown comes up as often as a severe one. |
 | `maxResumeDelayMs` | `VITEST_FLAKY_MAX_RESUME`, or `100` | How late a test may resume after a `findBy` or `waitFor`, up to 2147483647. |
 | `testingLibrary` | | `{ configure, getConfig }` from your Testing Library package. Without it the late resume is left out; the timers are still shortened. |
-| `exempt` | `DEFAULT_EXEMPT` | As above, a pattern or a list. |
+| `exempt` | `DEFAULT_EXEMPT` | As above. |
+
+### `clearAppTimersAtEnd(options)`
+
+Records every timeout and interval the app sets, and clears the ones still pending when the test file ends. Call it from
+a setup file: Vitest runs that once per test file, so the `afterAll` it registers runs at the end of each. It works
+whether stress mode is on or not. A timer set while fake timers are on belongs to their clock and is not recorded.
+Returns a function that undoes it.
+
+| Option | Default | |
+|---|---|---|
+| `afterAll` | | Vitest's `afterAll`, passed in so the package does not import vitest. Without it, a `TypeError`. |
+| `exempt` | `DEFAULT_EXEMPT` | As above. |
+| `report` | `false` | List what it cleared, with each timer's caller, through `console.warn`. |
+
+### `isDefaultExempt(timer)`
+
+Whether `DEFAULT_EXEMPT` matches the timer's `caller`, for an `exempt` function that adds to the default.
 
 ### `vitest-flaky [rounds] [options] [vitest arguments]`
 
@@ -162,13 +210,16 @@ on its own, as under the out-of-memory killer, is a failed seed with a replay co
 
 ## Limits
 
-- Only `setTimeout` and `setInterval` on the global object (and `window`) are wrapped. A timer from `node:timers` or
-  `node:timers/promises`, or from a reference taken before `installStress` ran, keeps its delay, and so does a timeout
-  longer than 2147483647 ms.
+- Only the timer functions on the global object (and `window`) are wrapped. A timer from `node:timers` or
+  `node:timers/promises`, or from a reference taken before the setup file ran, keeps its delay and is not cleared at
+  the end of the file. A timeout longer than 2147483647 ms keeps its delay too.
 - Call `installStress` once per test run. A second call while the first is installed wraps it, so a delay shortens
-  twice. A setup file that runs for every test file in one process (`isolate: false`) does that.
+  twice. A setup file that runs for every test file in one process (`isolate: false`) does that. Of two
+  `clearAppTimersAtEnd` calls, only the one installed last records timers, with its own `exempt`.
 - A timer's caller is found by its file path, so code that schedules timers through a helper in your test folder counts
   as test code.
+- `clearAppTimersAtEnd` does not see a timeout set with a string to run instead of a function, which jsdom allows and
+  Node does not.
 - The order timers are set in must be the same from run to run for a seed to replay exactly; a test that depends on real
   wall-clock time can still differ.
 - A test that asserts something has not happened yet (a debounced save has not fired, a toast is still showing) fails
